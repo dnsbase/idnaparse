@@ -1,0 +1,9 @@
+dist-newstyle/
+cabal.project.local
+.ghc.environment.*
+*.hi
+*.o
+.DS_Store
+
+# Pre-staged commit messages; not source.
+commits/
