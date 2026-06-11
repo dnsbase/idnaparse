@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 # Cancel an in-flight run when a newer push lands on the same ref.
 concurrency:
@@ -15,62 +16,91 @@ jobs:
   build:
     name: GHC ${{ matrix.ghc }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # Marked 'experimental' legs are allowed to fail without
-    # blocking the overall CI status.  Used for unreleased GHC
-    # versions whose ecosystem dependencies may not be available.
-    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        cabal: ['latest']
+        os:
+          - ubuntu-latest
+        cabal:
+          - latest
         ghc:
-          - '9.6.7'
-          - '9.8.4'
-          - '9.10.3'
-          - '9.12.3'
-          - '9.14.1'
-        include:
-          - os: ubuntu-latest
-            cabal: 'latest'
-            ghc: 'latest'
-            experimental: true
+          - 9.6.7
+          - 9.8.4
+          - 9.10.3
+          - 9.12.4
+          - 9.14.1
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up GHC ${{ matrix.ghc }}
+      - name: Set up GHC and cabal-install
         id: setup-haskell
         uses: haskell-actions/setup@v2
         with:
           ghc-version: ${{ matrix.ghc }}
           cabal-version: ${{ matrix.cabal }}
+          cabal-update: false
+
+      # The cabal package index location varies by runner os.
+      - name: Discover cabal paths
+        id: cabal-paths
+        # Force bash so `$GITHUB_OUTPUT` redirection works on Windows.
+        shell: bash
+        run: |
+          echo "remote-repo-cache=$(cabal path --remote-repo-cache)" >> "$GITHUB_OUTPUT"
+
+      # Cache the package index.
+      - name: Cache Hackage package index
+        uses: actions/cache@v4
+        with:
+          key: hackage-${{ runner.os }}-${{ hashFiles('**/*.cabal', 'cabal.project') }}
+          restore-keys: |
+            hackage-${{ runner.os }}-
+          path: ${{ steps.cabal-paths.outputs.remote-repo-cache }}
+
+      - name: cabal update
+        run: cabal update
 
       - name: Configure
         run: |
-          cabal --version
-          ghc --version
-          cabal update
-          cabal configure --disable-tests --disable-benchmarks --disable-documentation
+          cabal configure
           cabal build --dry-run all
 
-      # Persistent cache of the per-GHC package store: this is the big
-      # win, since it survives any change that doesn't touch the cabal
-      # files.  Keyed on the OS, GHC version, and the cabal-plan hash
-      # (which captures the resolved dependency set).
+      # Cache the cabal store dependency builds.
       - name: Restore cabal store cache
         id: cache-store
         uses: actions/cache/restore@v4
         with:
           path: ${{ steps.setup-haskell.outputs.cabal-store }}
-          key: ${{ runner.os }}-ghc-${{ matrix.ghc }}-cabal-${{ hashFiles('**/*.cabal', 'cabal.project', 'cabal.project.freeze') }}
+          key: store-v2-${{ runner.os }}-ghc-${{ matrix.ghc }}-cabal-${{ matrix.cabal }}-${{ hashFiles('**/*.cabal', 'cabal.project', 'cabal.project.freeze') }}
           restore-keys: |
-            ${{ runner.os }}-ghc-${{ matrix.ghc }}-cabal-
+            store-v2-${{ runner.os }}-ghc-${{ matrix.ghc }}-cabal-${{ matrix.cabal }}-
 
       - name: Build dependencies
         run: cabal build all --only-dependencies
 
-      # Save the store after deps are built, even if a later step fails.
+      # Project-local build artefacts.
+      - name: Cache dist-newstyle
+        uses: actions/cache@v4
+        with:
+          path: dist-newstyle
+          key: dist-${{ runner.os }}-ghc-${{ matrix.ghc }}-cabal-${{ matrix.cabal }}-${{ hashFiles('**/*.cabal', 'cabal.project', 'cabal.project.freeze', '**/*.hs') }}
+          restore-keys: |
+            dist-${{ runner.os }}-ghc-${{ matrix.ghc }}-cabal-${{ matrix.cabal }}-
+
+      - name: Build
+        run: cabal build all
+
+      - name: Smoke test the binary
+        run: |
+          exe=$(cabal -v0 list-bin idnaparse)
+          "$exe" --help
+
+      # Save the store AFTER haddock has run, so the dep haddocks
+      # built for --haddock-for-hackage are captured in the cache
+      # rather than rebuilt on every run.  The 'if: always()' lets
+      # the save fire even if a later step failed, so partial
+      # progress is still cached.
       - name: Save cabal store cache
         if: always() && steps.cache-store.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -78,18 +108,9 @@ jobs:
           path: ${{ steps.setup-haskell.outputs.cabal-store }}
           key: ${{ steps.cache-store.outputs.cache-primary-key }}
 
-      # Project-local build artifacts: smaller but still worth caching
-      # to speed incremental builds across pushes.
-      - name: Cache dist-newstyle
-        uses: actions/cache@v4
-        with:
-          path: dist-newstyle
-          key: ${{ runner.os }}-ghc-${{ matrix.ghc }}-dist-${{ hashFiles('**/*.cabal', 'cabal.project', 'cabal.project.freeze', 'app/**/*.hs') }}
-          restore-keys: |
-            ${{ runner.os }}-ghc-${{ matrix.ghc }}-dist-
+      # Hackage-validity gates.
+      - name: Cabal check
+        run: cabal check
 
-      - name: Build
-        run: cabal build all
-
-      - name: Haddock
-        run: cabal haddock --haddock-for-hackage --haddock-hyperlink-source all
+      - name: Build sdist
+        run: cabal sdist

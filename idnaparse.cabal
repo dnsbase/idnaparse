@@ -1,7 +1,7 @@
-cabal-version: 3.8
+cabal-version: 3.0
 
 name:           idnaparse
-version:        0.1.0.0
+version:        1.0.0.0
 synopsis:       IDNA-aware DNS-name lint and reporter
 description:
     @idnaparse@ reads a stream of presentation-form domain names
